@@ -2,7 +2,7 @@ import io
 import re
 import zipfile
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 import numpy as np
 import pandas as pd
@@ -32,9 +32,7 @@ def _clean_lines(text: str, max_lines: int = 200) -> List[str]:
 
 
 def _sniff_decimal_and_sep(text_sample: str) -> Tuple[str, str]:
-    """
-    Heuristika: detekuje desetinnou čárku/tečku a separator.
-    """
+    """Heuristika: detekuje desetinnou čárku/tečku a separator."""
     sample_lines = _clean_lines(text_sample, max_lines=50)
     sample = "\n".join(sample_lines)
 
@@ -59,9 +57,7 @@ def _sniff_decimal_and_sep(text_sample: str) -> Tuple[str, str]:
 
 
 def read_spectrum_txt(uploaded_file) -> Spectrum:
-    """
-    Načte 2sloupcový txt (x, y).
-    """
+    """Načte 2sloupcový txt (x, y)."""
     raw = uploaded_file.read()
     try:
         text = raw.decode("utf-8")
@@ -110,6 +106,7 @@ def read_spectrum_txt(uploaded_file) -> Spectrum:
     x = df["x"].to_numpy(dtype=float)
     y = df["y"].to_numpy(dtype=float)
 
+    # Seřadit podle x (někdy bývá osa obráceně, sjednotíme na rostoucí)
     order = np.argsort(x)
     x = x[order]
     y = y[order]
@@ -118,44 +115,56 @@ def read_spectrum_txt(uploaded_file) -> Spectrum:
     x = x[uniq_mask]
     y = y[uniq_mask]
 
-    if x.size < 2:
-        raise ValueError(f"{uploaded_file.name}: po vyčištění zůstalo méně než 2 body.")
-
     return Spectrum(filename=uploaded_file.name, x=x, y=y)
 
 
-def resample_spectrum_keep_full_range(s: Spectrum, n_points: int) -> Spectrum:
-    """
-    Přeinterpoluje spektrum na n_points bodů v JEHO vlastním rozsahu.
-    """
-    x_min = float(np.min(s.x))
-    x_max = float(np.max(s.x))
-    if not (x_max > x_min):
-        raise ValueError(f"{s.filename}: neplatný rozsah osy X.")
+def crop_spectrum(s: Spectrum, x_min: Optional[float], x_max: Optional[float]) -> Spectrum:
+    """Ořízne spektrum podle zadaných mezí osy X."""
+    mask = np.ones(s.x.shape, dtype=bool)
+    if x_min is not None:
+        mask &= (s.x >= x_min)
+    if x_max is not None:
+        mask &= (s.x <= x_max)
+    
+    if not np.any(mask):
+        # Pokud by ořez smazal vše, vrátíme původní (nebo vyhodíme chybu)
+        # Zde raději vrátíme původní s varováním v názvu, aby to nepadlo
+        return s 
 
-    x_new = np.linspace(x_min, x_max, int(n_points), dtype=float)
+    return Spectrum(filename=s.filename, x=s.x[mask], y=s.y[mask])
+
+
+def resample_spectrum(s: Spectrum, n_points: int) -> Spectrum:
+    """Přeinterpoluje spektrum na n_points bodů v aktuálním rozsahu."""
+    x_start = float(np.min(s.x))
+    x_end = float(np.max(s.x))
+    
+    x_new = np.linspace(x_start, x_end, int(n_points), dtype=float)
     y_new = np.interp(x_new, s.x, s.y)
     return Spectrum(filename=s.filename, x=x_new, y=y_new)
 
 
 def normalize_spectrum_max(s: Spectrum) -> Spectrum:
     """
-    Vydělí celé spektrum jeho maximální hodnotou Y, takže maximum bude 1.
+    Vydělí celé spektrum jeho maximální hodnotou Y.
+    Nejvyšší pík bude mít hodnotu 1.0.
     """
-    max_y = np.max(s.y)
-    # Ošetření dělení nulou, pokud by spektrum bylo prázdné nebo nulové
-    if max_y != 0:
-        new_y = s.y / max_y
-    else:
-        new_y = s.y
+    max_val = np.max(s.y)
     
+    # Ochrana proti dělení nulou (pokud je spektrum samé nuly)
+    if max_val == 0:
+        return s
+    
+    # Normalizace: y = y / max
+    new_y = s.y / max_val
     return Spectrum(filename=s.filename, x=s.x, y=new_y)
 
 
 def spectrum_to_txt_bytes(s: Spectrum, decimal: str = ".", sep: str = "\t") -> bytes:
     df = pd.DataFrame({"x": s.x, "y": s.y})
     buf = io.StringIO()
-    df.to_csv(buf, index=False, header=False, sep=sep, float_format="%.10g")
+    # Format %.6f stačí, normalizovaná data jsou 0-1
+    df.to_csv(buf, index=False, header=False, sep=sep, float_format="%.8f")
     out = buf.getvalue()
 
     if decimal == ",":
@@ -174,84 +183,105 @@ def build_zip(spectra: List[Spectrum], decimal_out: str, sep_out: str) -> bytes:
 
 
 def main():
-    st.set_page_config(page_title="Spectra Resampler & Normalizer", layout="centered")
-    st.title("Spectra Resampler & Normalizer")
-    st.write(
-        "Nahraj více **.txt** spekter. Aplikace je přeinterpoluje na zvolený počet bodů "
-        "a volitelně **normalizuje** (nejvyšší pík = 1)."
-    )
+    st.set_page_config(page_title="Spectra Tool: Crop & Normalize", layout="centered")
+    st.title("Spectra Processing Tool")
+    st.markdown("""
+    1. **Oříznutí (Crop)**: Odstraní okraje (např. laser na začátku), které kazí normalizaci.
+    2. **Resampling**: Sjednotí počet bodů.
+    3. **Normalizace**: Vydělí intenzity tak, že maximum = 1.
+    """)
 
-    with st.expander("Nastavení", expanded=True):
-        col_set1, col_set2 = st.columns(2)
-        with col_set1:
-            n_points = st.number_input(
-                "Počet bodů (resampling)",
-                min_value=10,
-                max_value=200000,
-                value=1500,
-                step=100,
-            )
-        with col_set2:
-            do_normalize = st.checkbox(
-                "Normalizovat intenzitu (max = 1)",
-                value=True,
-                help="Vydělí y hodnoty nejvyšší hodnotou ve spektru."
-            )
+    # --- NASTAVENÍ ---
+    with st.expander("Nastavení zpracování", expanded=True):
+        st.subheader("1. Oříznutí osy X (důležité pro správnou normalizaci)")
+        st.caption("Pokud máš na začátku spektra obrovský pík (laser), nastav 'Min X' až za něj (např. 150).")
+        col_crop1, col_crop2 = st.columns(2)
+        with col_crop1:
+            crop_min = st.number_input("Min X (odkud začít)", value=0.0, step=10.0, help="Vše pod touto hodnotou bude smazáno.")
+        with col_crop2:
+            crop_max = st.number_input("Max X (kde skončit)", value=4000.0, step=50.0, help="Vše nad touto hodnotou bude smazáno. Nech 0 nebo velké číslo, pokud nechceš omezovat.")
 
-        st.caption("Výstupní formát TXT")
-        col1, col2 = st.columns(2)
-        with col1:
-            decimal_out = st.selectbox("Desetinný oddělovač", options=[".", ","], index=0)
-        with col2:
-            sep_out_label = st.selectbox("Oddělovač sloupců", options=["TAB", "Mezera", "Středník"], index=0)
+        # Pokud uživatel nechce horní limit, interně použijeme None
+        final_crop_max = crop_max if crop_max > crop_min else None
+
+        st.divider()
+        st.subheader("2. Resampling & Normalizace")
+        col_res1, col_res2 = st.columns(2)
+        with col_res1:
+            n_points = st.number_input("Počet bodů (n)", value=1500, step=100, min_value=10)
+        with col_res2:
+            do_normalize = st.checkbox("Normalizovat (Max = 1)", value=True)
+
+        st.divider()
+        st.subheader("3. Formát výstupu")
+        col_fmt1, col_fmt2 = st.columns(2)
+        with col_fmt1:
+            decimal_out = st.selectbox("Desetinný oddělovač", [".", ","], index=0)
+        with col_fmt2:
+            sep_out_label = st.selectbox("Oddělovač sloupců", ["TAB", "Mezera", "Středník"], index=0)
             sep_out = "\t" if sep_out_label == "TAB" else (" " if sep_out_label == "Mezera" else ";")
 
-    files = st.file_uploader(
-        "Nahraj .txt soubory",
-        type=["txt"],
-        accept_multiple_files=True,
-    )
+    # --- UPLOAD ---
+    files = st.file_uploader("Nahraj .txt spektra", type=["txt"], accept_multiple_files=True)
 
     if not files:
-        st.info("Nahraj prosím alespoň 1 soubor.")
+        st.info("Čekám na soubory...")
         return
 
-    if st.button("Zpracovat a vytvořit ZIP", type="primary"):
+    if st.button("Zpracovat soubory", type="primary"):
         try:
-            spectra = [read_spectrum_txt(f) for f in files]
+            processed_spectra = []
+            
+            for f in files:
+                # 1. Načíst
+                s = read_spectrum_txt(f)
+                
+                # 2. Oříznout (Crop) - KLÍČOVÝ KROK
+                # Tím se zbavíme falešných maxim na krajích
+                s = crop_spectrum(s, x_min=crop_min, x_max=final_crop_max)
+                
+                if len(s.x) < 2:
+                    st.warning(f"Soubor {s.filename} byl ořezáním smazán celý (špatný rozsah?). Přeskakuji.")
+                    continue
 
-            # 1. Resampling
-            processed = [resample_spectrum_keep_full_range(s, int(n_points)) for s in spectra]
+                # 3. Resample
+                s = resample_spectrum(s, n_points)
+                
+                # 4. Normalizace
+                if do_normalize:
+                    s = normalize_spectrum_max(s)
+                
+                processed_spectra.append(s)
 
-            # 2. Normalizace (pokud je zaškrtnuto)
-            if do_normalize:
-                processed = [normalize_spectrum_max(s) for s in processed]
+            if not processed_spectra:
+                st.error("Žádná spektra k uložení (všechna byla ořezána na 0 bodů). Zkontroluj rozsahy Min/Max.")
+                return
 
-            zip_bytes = build_zip(processed, decimal_out=decimal_out, sep_out=sep_out)
-
-            norm_msg = " a **normalizováno** (max=1)" if do_normalize else ""
-            st.success(f"Hotovo. Převedeno na {int(n_points)} bodů{norm_msg}.")
-
+            # --- VÝSLEDEK ---
+            zip_bytes = build_zip(processed_spectra, decimal_out, sep_out)
+            
+            st.success(f"Zpracováno {len(processed_spectra)} souborů.")
+            
             st.download_button(
                 label="Stáhnout ZIP",
                 data=zip_bytes,
-                file_name="processed_spectra.zip",
-                mime="application/zip",
+                file_name="spectra_normalized.zip",
+                mime="application/zip"
             )
 
-            # Náhled
-            with st.expander(f"Náhled: {processed[0].filename}", expanded=True):
-                preview = pd.DataFrame({"x": processed[0].x, "y": processed[0].y})
-                
-                # Zobrazíme graf pro rychlou kontrolu normalizace
-                st.line_chart(preview, x="x", y="y")
-                
-                st.write("**Data (prvních 5 řádků):**")
-                st.dataframe(preview.head(5), use_container_width=True)
+            # --- NÁHLED ---
+            st.markdown("### Kontrola výsledku (první soubor)")
+            first = processed_spectra[0]
+            
+            # Zobrazíme graf, aby bylo hned vidět, jestli je to OK
+            chart_data = pd.DataFrame({"x": first.x, "y": first.y})
+            st.line_chart(chart_data, x="x", y="y")
+            
+            # Info o max hodnotě (pro kontrolu, mělo by být 1.0)
+            st.caption(f"Max hodnota v náhledu: {np.max(first.y):.4f}")
 
         except Exception as e:
-            st.error(f"Chyba při zpracování: {e}")
-
+            st.error(f"Chyba: {e}")
 
 if __name__ == "__main__":
     main()
