@@ -34,7 +34,6 @@ def _clean_lines(text: str, max_lines: int = 200) -> List[str]:
 def _sniff_decimal_and_sep(text_sample: str) -> Tuple[str, str]:
     """
     Heuristika: detekuje desetinnou čárku/tečku a separator.
-    Typicky: whitespace nebo tab, někdy ; (Excel). CSV s ',' delimiterem jen když decimal='.'.
     """
     sample_lines = _clean_lines(text_sample, max_lines=50)
     sample = "\n".join(sample_lines)
@@ -52,9 +51,7 @@ def _sniff_decimal_and_sep(text_sample: str) -> Tuple[str, str]:
     elif tab > 0:
         sep = "\t"
     else:
-        # default: whitespace
         sep = r"\s+"
-        # CSV s ',' jako oddělovač jen když decimal='.'
         if decimal == "." and comma > 0 and semi == 0 and tab == 0:
             sep = ","
 
@@ -63,8 +60,7 @@ def _sniff_decimal_and_sep(text_sample: str) -> Tuple[str, str]:
 
 def read_spectrum_txt(uploaded_file) -> Spectrum:
     """
-    Načte 2sloupcový txt (x, y). Zvládne desetinnou čárku i tečku.
-    Ignoruje prázdné řádky, komentáře (#, //) a hlavičky (nenumerické řádky).
+    Načte 2sloupcový txt (x, y).
     """
     raw = uploaded_file.read()
     try:
@@ -75,7 +71,6 @@ def read_spectrum_txt(uploaded_file) -> Spectrum:
     sample = text[:8000]
     decimal, sep = _sniff_decimal_and_sep(sample)
 
-    # Pokus 1: pandas read_csv
     df = None
     try:
         df = pd.read_csv(
@@ -90,26 +85,21 @@ def read_spectrum_txt(uploaded_file) -> Spectrum:
     except Exception:
         df = None
 
-    # Fallback: ruční split (kdyby to mělo divné hlavičky / mix delimitérů)
     if df is None or df.shape[1] < 2:
         rows = []
         for line in text.splitlines():
             s = line.strip()
             if not s or s.startswith("#") or s.startswith("//"):
                 continue
-            # split na ; , tab nebo whitespace
             parts = re.split(r"[;\t, ]+", s)
             if len(parts) < 2:
                 continue
             rows.append(parts[:2])
         df = pd.DataFrame(rows)
 
-    # Vezmi první 2 sloupce
     df = df.iloc[:, :2].copy()
     df.columns = ["x", "y"]
 
-    # Odstraň řádky s // komentářem (pandas neumí comment='//')
-    # + konverze na čísla
     df["x"] = pd.to_numeric(df["x"], errors="coerce")
     df["y"] = pd.to_numeric(df["y"], errors="coerce")
     df = df.dropna(subset=["x", "y"])
@@ -120,12 +110,10 @@ def read_spectrum_txt(uploaded_file) -> Spectrum:
     x = df["x"].to_numpy(dtype=float)
     y = df["y"].to_numpy(dtype=float)
 
-    # Seřadit podle x (někdy bývá osa obráceně)
     order = np.argsort(x)
     x = x[order]
     y = y[order]
 
-    # Odstranit duplicitní x (interpolace vyžaduje striktně rostoucí x)
     uniq_mask = np.concatenate(([True], np.diff(x) != 0))
     x = x[uniq_mask]
     y = y[uniq_mask]
@@ -138,29 +126,38 @@ def read_spectrum_txt(uploaded_file) -> Spectrum:
 
 def resample_spectrum_keep_full_range(s: Spectrum, n_points: int) -> Spectrum:
     """
-    Přeinterpoluje spektrum na n_points bodů v JEHO vlastním rozsahu (min(x) .. max(x)).
-    Nic neořezává.
+    Přeinterpoluje spektrum na n_points bodů v JEHO vlastním rozsahu.
     """
     x_min = float(np.min(s.x))
     x_max = float(np.max(s.x))
     if not (x_max > x_min):
-        raise ValueError(f"{s.filename}: neplatný rozsah osy X (x_min={x_min}, x_max={x_max}).")
+        raise ValueError(f"{s.filename}: neplatný rozsah osy X.")
 
     x_new = np.linspace(x_min, x_max, int(n_points), dtype=float)
     y_new = np.interp(x_new, s.x, s.y)
     return Spectrum(filename=s.filename, x=x_new, y=y_new)
 
 
+def normalize_spectrum_max(s: Spectrum) -> Spectrum:
+    """
+    Vydělí celé spektrum jeho maximální hodnotou Y, takže maximum bude 1.
+    """
+    max_y = np.max(s.y)
+    # Ošetření dělení nulou, pokud by spektrum bylo prázdné nebo nulové
+    if max_y != 0:
+        new_y = s.y / max_y
+    else:
+        new_y = s.y
+    
+    return Spectrum(filename=s.filename, x=s.x, y=new_y)
+
+
 def spectrum_to_txt_bytes(s: Spectrum, decimal: str = ".", sep: str = "\t") -> bytes:
-    """
-    Export do txt: 2 sloupce, bez hlavičky, default TAB.
-    """
     df = pd.DataFrame({"x": s.x, "y": s.y})
     buf = io.StringIO()
     df.to_csv(buf, index=False, header=False, sep=sep, float_format="%.10g")
     out = buf.getvalue()
 
-    # Pokud chceš desetinnou čárku, bezpečně nahradíme tečky (sep je tab/mezera/středník)
     if decimal == ",":
         out = out.replace(".", ",")
 
@@ -168,9 +165,6 @@ def spectrum_to_txt_bytes(s: Spectrum, decimal: str = ".", sep: str = "\t") -> b
 
 
 def build_zip(spectra: List[Spectrum], decimal_out: str, sep_out: str) -> bytes:
-    """
-    Zabalí všechna spektra do ZIPu se zachováním názvů.
-    """
     mem = io.BytesIO()
     with zipfile.ZipFile(mem, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
         for s in spectra:
@@ -180,22 +174,29 @@ def build_zip(spectra: List[Spectrum], decimal_out: str, sep_out: str) -> bytes:
 
 
 def main():
-    st.set_page_config(page_title="Spectra Resampler (Raman/IR)", layout="centered")
-    st.title("Spectra Resampler (Raman / IR)")
+    st.set_page_config(page_title="Spectra Resampler & Normalizer", layout="centered")
+    st.title("Spectra Resampler & Normalizer")
     st.write(
-        "Nahraj více **.txt** spekter (2 sloupce: X=vlnočty/osa, Y=intenzita). "
-        "Aplikace **neořezává okraje** — každé spektrum resampluje v jeho původním rozsahu "
-        "na stejný počet bodů a vrátí ZIP."
+        "Nahraj více **.txt** spekter. Aplikace je přeinterpoluje na zvolený počet bodů "
+        "a volitelně **normalizuje** (nejvyšší pík = 1)."
     )
 
     with st.expander("Nastavení", expanded=True):
-        n_points = st.number_input(
-            "Počet bodů po resamplingu (stejný pro všechny soubory)",
-            min_value=10,
-            max_value=200000,
-            value=1500,
-            step=100,
-        )
+        col_set1, col_set2 = st.columns(2)
+        with col_set1:
+            n_points = st.number_input(
+                "Počet bodů (resampling)",
+                min_value=10,
+                max_value=200000,
+                value=1500,
+                step=100,
+            )
+        with col_set2:
+            do_normalize = st.checkbox(
+                "Normalizovat intenzitu (max = 1)",
+                value=True,
+                help="Vydělí y hodnoty nejvyšší hodnotou ve spektru."
+            )
 
         st.caption("Výstupní formát TXT")
         col1, col2 = st.columns(2)
@@ -206,42 +207,47 @@ def main():
             sep_out = "\t" if sep_out_label == "TAB" else (" " if sep_out_label == "Mezera" else ";")
 
     files = st.file_uploader(
-        "Nahraj .txt soubory (můžeš označit více najednou)",
+        "Nahraj .txt soubory",
         type=["txt"],
         accept_multiple_files=True,
     )
 
     if not files:
-        st.info("Nahraj prosím alespoň 1 soubor (klidně více).")
+        st.info("Nahraj prosím alespoň 1 soubor.")
         return
 
     if st.button("Zpracovat a vytvořit ZIP", type="primary"):
         try:
             spectra = [read_spectrum_txt(f) for f in files]
 
-            # Resampling bez ořezu: každé spektrum si zachová svůj min..max
-            resampled = [resample_spectrum_keep_full_range(s, int(n_points)) for s in spectra]
+            # 1. Resampling
+            processed = [resample_spectrum_keep_full_range(s, int(n_points)) for s in spectra]
 
-            zip_bytes = build_zip(resampled, decimal_out=decimal_out, sep_out=sep_out)
+            # 2. Normalizace (pokud je zaškrtnuto)
+            if do_normalize:
+                processed = [normalize_spectrum_max(s) for s in processed]
 
-            # Shrnutí rozsahů (pro kontrolu)
-            ranges = [(s.filename, float(np.min(s.x)), float(np.max(s.x))) for s in resampled]
-            st.success(f"Hotovo. Každý soubor má nyní **{int(n_points)}** bodů a zachovaný původní rozsah osy X.")
+            zip_bytes = build_zip(processed, decimal_out=decimal_out, sep_out=sep_out)
+
+            norm_msg = " a **normalizováno** (max=1)" if do_normalize else ""
+            st.success(f"Hotovo. Převedeno na {int(n_points)} bodů{norm_msg}.")
 
             st.download_button(
-                label="Stáhnout ZIP se zpracovanými spektry",
+                label="Stáhnout ZIP",
                 data=zip_bytes,
-                file_name="resampled_spectra.zip",
+                file_name="processed_spectra.zip",
                 mime="application/zip",
             )
 
-            with st.expander("Kontrola: rozsahy X po resamplingu", expanded=False):
-                df_ranges = pd.DataFrame(ranges, columns=["soubor", "x_min", "x_max"])
-                st.dataframe(df_ranges, use_container_width=True)
-
-            with st.expander("Náhled: prvních 5 řádků prvního resamplovaného spektra", expanded=False):
-                preview = pd.DataFrame({"x": resampled[0].x, "y": resampled[0].y}).head(5)
-                st.dataframe(preview, use_container_width=True)
+            # Náhled
+            with st.expander(f"Náhled: {processed[0].filename}", expanded=True):
+                preview = pd.DataFrame({"x": processed[0].x, "y": processed[0].y})
+                
+                # Zobrazíme graf pro rychlou kontrolu normalizace
+                st.line_chart(preview, x="x", y="y")
+                
+                st.write("**Data (prvních 5 řádků):**")
+                st.dataframe(preview.head(5), use_container_width=True)
 
         except Exception as e:
             st.error(f"Chyba při zpracování: {e}")
